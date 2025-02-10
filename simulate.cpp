@@ -10,8 +10,14 @@
 #include <unistd.h>
 #include <libaio.h>
 #include <zlib.h>
-
+#include <fstream>
+#include <unordered_set>
+#include <unordered_map>
+#include <optional>
 #define BLOCK_SIZE 4096 
+#define BUFFER_SIZE BLOCK_SIZE 
+#define FILENAME "filename.txt"
+#define BLOCK_DEVICE "/var/lib/ceph/osd/ceph-0/block" 
 
 struct IOEntry {
     size_t offset;
@@ -41,79 +47,162 @@ size_t generate_random_offset() {
 uint32_t calculate_crc32(const char* buffer, size_t size) {
     return crc32(0, reinterpret_cast<const unsigned char*>(buffer), size);
 }
-/*
-uint32_t calculate_crc(const std::vector<uint8_t>& data) {
-    return crc32(0L, data.data(), data.size());
-}*/
+
+bool exists_in_unsorted(const size_t* arr, size_t size, long long target) {
+    std::unordered_set<size_t> elements(arr, arr + size);
+    return elements.find(static_cast<size_t>(target)) != elements.end();
+}
+
+std::optional<size_t> find_index_in_unsorted(const size_t* arr, size_t size, long long target) {
+    std::unordered_map<size_t, size_t> index_map;  // Maps value to its index
+
+    for (size_t i = 0; i < size; ++i) {
+        index_map[arr[i]] = i;  // Store the first occurrence
+    }
+
+    auto it = index_map.find(static_cast<size_t>(target));
+    if (it != index_map.end()) {
+        return it->second;  // Return the index if found
+    }
+    
+    return std::nullopt;  // Return empty if not found
+}
+
+void remove_element(size_t arr[], size_t& size, int index) {
+    if (index >= size) return;
+
+    for (size_t i = index; i < size - 1; i++) {
+        arr[i] = arr[i + 1]; // Shift elements left
+    }
+    size--; // Reduce the size
+}
+
+void remove_elementio(IOEntry arr[], size_t& size, int index) {
+    if (index >= size) return;
+
+    for (size_t i = index; i < size - 1; i++) {
+        arr[i] = arr[i + 1]; // Shift elements left
+    }
+    size--; // Reduce the size
+}
+
 
 // Writer Thread
-void writer_thread(const std::string& disk_path, int num_writes) {
+void writer_thread(int fd, int num_writes) {
+    io_context_t ctx = 0; // AIO context
+    int ret;
 
-    char write_buffer[4096];
-    memset(write_buffer, 'A', sizeof(write_buffer));
-    int fd = open(disk_path.c_str(), O_DIRECT | O_WRONLY | O_CREAT, 0644);
+    /*
+    //int fd = open(disk_path.c_str(), O_DIRECT | O_WRONLY | O_CREAT, 0644);
+    int fd = open(BLOCK_DEVICE, O_RDWR | O_DIRECT);
     if (fd < 0) {
         perror("Error opening file for writing");
         return;
-    }
+    }*/
 
-    io_context_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    if (io_setup(10, &ctx) < 0) {
+     // Initialize the AIO context
+    ret = io_setup(128, &ctx);
+    if (ret < 0) {
         perror("io_setup failed");
-        close(fd);
+        //close(fd);
         return;
     }
 
-   
-    struct iocb* cbs[num_writes];
+     // Allocate aligned memory for direct I/O
+    char *write_buf;
+    if (posix_memalign((void **)&write_buf, BLOCK_SIZE, BUFFER_SIZE)) {
+        perror("posix_memalign failed");
+        io_destroy(ctx);
+        //close(fd);
+        return;
+    }
 
+    // Fill write buffer with test data
+    memset(write_buf, 'A', BUFFER_SIZE);
+    uint32_t crc = calculate_crc32(write_buf, BLOCK_SIZE);
+
+
+    struct iocb* cbs[num_writes];
+    IOEntry crcoffsets[num_writes];
+    size_t offsets[num_writes];
     for (int i = 0; i < num_writes; i++) {
         size_t offset = generate_random_offset();
-       
-        uint32_t crc = calculate_crc32(reinterpret_cast<const char*>(write_buffer), BLOCK_SIZE);
         cbs[i] = new struct iocb(); 
 	    struct iovec iov[1];
-	    iov[0].iov_base = write_buffer;
-        iov[0].iov_len = strlen(write_buffer);
-        cbs[i]->aio_lio_opcode = IO_CMD_PWRITEV;
+	    iov[0].iov_base = write_buf;
+        iov[0].iov_len = BUFFER_SIZE;
         cbs[i]->aio_fildes = fd;
+        crcoffsets[i].offset = offset;
+        crcoffsets[i].crc = crc;
+        offsets[i] = offset;
         io_prep_pwritev(cbs[i], fd, iov, 1, offset);
-        std::cout << "[Writer] at offset: " << offset << "CRC: " << crc << std::endl;
-       
+        //std::cout << "[Writer] at offset: " << offset << "CRC: " << crc << "\n" << std::endl;
+        if ( offset == 0 ) {
+            std::cout << "Gunaaaaaaa: " << offset << " CRC: " << crc << std::endl;
+        }
         std::lock_guard<std::mutex> lock(queue_mutex);
-        io_queue.push({offset, std::chrono::steady_clock::now(), crc});
+        //io_queue.push({offset, std::chrono::steady_clock::now(), crc});
     }
 
     if (io_submit(ctx, num_writes, cbs) < 0) {
          perror("io_submit write failed");
     }
 
-    struct io_event events[1];
-    if (io_getevents(ctx, 1, 1, events, NULL) < 0) {
+    struct io_event events[num_writes];
+    //int num_events = io_getevents(ctx, 1, 1, events, NULL);
+    /*if ( num_events < 0) {
         perror("io_getevents (write) failed");
     } else {
         printf("AIO write completed successfully\n");
+    }*/
+
+    size_t size = sizeof(offsets) / sizeof(offsets[0]);
+    size_t size2 = sizeof(crcoffsets) / sizeof(crcoffsets[0]);
+    size_t temp = static_cast<size_t>(num_writes); 
+    int num_events;
+    while (temp != 0) {
+        num_events = io_getevents(ctx, 1, temp, events, NULL);
+        if (num_events < 0) {
+            perror("io_getevents (write) failed");
+            return;
+        }
+        for (size_t j = 0; j < num_events; j++) {      
+            auto result = find_index_in_unsorted(offsets, size, events[j].obj->u.c.offset);
+        
+            if (result) {
+                std::cout << "Received event for "<< events[j].obj->u.c.offset << std::endl;
+                io_queue.push({offsets[*result], std::chrono::steady_clock::now(), crcoffsets[*result].crc});
+                remove_element(offsets, size, *result);
+                remove_elementio(crcoffsets, size2, *result);
+                temp = temp - 1;
+            }
+        }
     }
-        queue_cv.notify_all();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));  // Simulate IO delay
+    queue_cv.notify_all();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));  // Simulate IO delay
 
     io_destroy(ctx);
-    close(fd);
+    //close(fd);
 }
 
-void reader_thread(const std::string& disk_path) {
-    int fd = open(disk_path.c_str(), O_DIRECT | O_RDONLY);
-    if (fd < 0) {
-        perror("Error opening file for reading");
-        return;
-    }
+void reader_thread(int fd) {
 
-    io_context_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    if (io_setup(10, &ctx) < 0) {
+    io_context_t ctx = 0; // AIO context
+    int ret;
+
+/*
+    //int fd = open(disk_path.c_str(), O_DIRECT | O_WRONLY | O_CREAT, 0644);
+    int fd = open(BLOCK_DEVICE, O_RDONLY | O_DIRECT);
+    if (fd < 0) {
+        perror("Error opening file for writing");
+        return;
+    }*/
+
+     // Initialize the AIO context
+    ret = io_setup(128, &ctx);
+    if (ret < 0) {
         perror("io_setup failed");
-        close(fd);
+        //close(fd);
         return;
     }
 
@@ -135,17 +224,24 @@ void reader_thread(const std::string& disk_path) {
             io_queue.pop();
         }
 
-        char read_buffer[4097] = {0};
+        char *read_buf;
+        if (posix_memalign((void **)&read_buf, BLOCK_SIZE, BUFFER_SIZE)) {
+            perror("posix_memalign failed");
+            io_destroy(ctx);
+            //close(fd);
+            return;
+        }
+
+        memset(read_buf, 0, BUFFER_SIZE);
         struct iocb cb;
         struct iocb* cbs[1];
         struct io_event events[1];
         struct iovec iov[1];
-        iov[0].iov_base = read_buffer;
-        iov[0].iov_len = sizeof(read_buffer) - 1;
-        //cb.aio_lio_opcode = IO_CMD_PREADV;
+        iov[0].iov_base = read_buf;
+        iov[0].iov_len = BUFFER_SIZE;
         cb.aio_fildes = fd;
 
-        io_prep_preadv(&cb, fd, iov, 1, entry.offset)
+        io_prep_preadv(&cb, fd, iov, 1, entry.offset);
         cbs[0] = &cb;
 
         if (io_submit(ctx, 1, cbs) < 0) {
@@ -159,17 +255,44 @@ void reader_thread(const std::string& disk_path) {
             continue;
         }
 
-        uint32_t read_crc = calculate_crc32(read_buffer, BLOCK_SIZE);
+        uint32_t read_crc = calculate_crc32(reinterpret_cast<const char*>(read_buf), BLOCK_SIZE);
+
+        for (int i = 0; i < 4; i++) {
+            if (read_crc == entry.crc) {
+                 //std::cout << "[Reader] Read from offset: " << entry.offset
+                 // << " Expected CRC: " << entry.crc
+                  //<< " Read CRC: " << read_crc
+                  //<< "CRC MATCH" << std::endl;
+                  //io_destroy(ctx);
+                  //close(fd);
+                  //std::cout << "CRC matched" << std::endl;
+                  return;
+            }
+            std::cout << "Retrying read: " << entry.offset << " Retry number: " << i << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            if (io_submit(ctx, 1, cbs) < 0) {
+                perror("io_submit read failed");
+                continue;
+            }
+            if (io_getevents(ctx, 1, 1, events, nullptr) < 0) {
+                perror("io_getevents failed");
+                continue;
+            }
+            read_crc = calculate_crc32(reinterpret_cast<const char*>(read_buf), BLOCK_SIZE);
+        }
+		std::ofstream out("output.txt", std::ios::app);
+		out << entry.offset <<  " Expected CRC: " << entry.crc << " Read CRC: " << read_crc << "\n";
 
         std::cout << "[Reader] Read from offset: " << entry.offset
-                  << " Expected CRC: " << entry.crc
-                  << " Read CRC: " << read_crc
-                  << " | " << (read_crc == entry.crc ? "CRC MATCH" : "CRC MISMATCH")
+                << " Expected CRC: " << entry.crc
+                << " Read CRC: " << read_crc
+                  <<  "CRC MISMATCH"
                   << std::endl;
-    }
-
-    io_destroy(ctx);
-    close(fd);
+        printf("%s\n", read_buf);
+        io_destroy(ctx);
+                  //close(fd);
+                  return;
+	}
 }
 
 int main(int argc, char* argv[]) {
@@ -188,12 +311,28 @@ int main(int argc, char* argv[]) {
     std::vector<std::thread> writers;
     std::vector<std::thread> readers;
 
+    
+    int fdwr = open(BLOCK_DEVICE, O_RDWR | O_DIRECT);
+    if (fdwr < 0) {
+        perror("Error opening file for writing");
+        return 1;
+    }
+
+    /*
+    int fdr = open(BLOCK_DEVICE, O_RDONLY | O_DIRECT);
+    if (fdr < 0) {
+        perror("Error opening file for writing");
+        return 1;
+    }*/
+
+   //for (int j = 0; j < 20 ; j++) {
+
     for (int i = 0; i < num_writer_threads; i++) {
-        writers.emplace_back(writer_thread, disk_path, 1);
+        writers.emplace_back(writer_thread, fdwr, 5);
     }
 
     for (int i = 0; i < num_reader_threads; i++) {
-        readers.emplace_back(reader_thread, disk_path);
+        readers.emplace_back(reader_thread, fdwr);
     }
 
     for (auto& t : writers) {
@@ -211,6 +350,8 @@ int main(int argc, char* argv[]) {
     for (auto& t : readers) {
         t.join();
     }
+   //}
+    close(fdwr);
 
     return 0;
 }
